@@ -1,86 +1,73 @@
-"""Community detection on NetworkX graphs. Uses Leiden (graspologic) if available, falls back to Louvain (networkx). Splits oversized communities. Returns cohesion scores."""
+"""Community detection on the FalkorDB-backed GraphStore. Runs Louvain via a
+server-side JS UDF (graphify_algos.louvain), splits oversized/low-cohesion
+communities, and returns stable community IDs with cohesion scores."""
 from __future__ import annotations
-import contextlib
-import inspect
-import io
-import json
-import sys
-import networkx as nx
 
 
-def _suppress_output():
-    """Context manager to suppress stdout/stderr during library calls.
+def _partition(G, resolution: float = 1.0) -> dict[str, int]:
+    """Run Louvain community detection. Returns {node_id: community_id}.
 
-    graspologic's leiden() emits ANSI escape sequences (progress bars,
-    colored warnings) that corrupt PowerShell 5.1's scroll buffer on
-    Windows (see issue #19). Redirecting stdout/stderr to devnull during
-    the call prevents this without losing any graphify output.
+    Delegates to the server-side `graphify_algos.louvain` UDF (deterministic:
+    sorted node order, no RNG). `G` is a GraphStore or a subgraph view, both of
+    which expose `louvain_partition(resolution)`.
+
+    resolution > 1.0 → more, smaller communities; < 1.0 → fewer, larger.
     """
-    return contextlib.redirect_stdout(io.StringIO())
-
-
-def _partition(G: nx.Graph, resolution: float = 1.0) -> dict[str, int]:
-    """Run community detection. Returns {node_id: community_id}.
-
-    Tries Leiden (graspologic) first — best quality.
-    Falls back to Louvain (built into networkx) if graspologic is not installed.
-
-    resolution > 1.0 → more, smaller communities.
-    resolution < 1.0 → fewer, larger communities.
-
-    Output from graspologic is suppressed to prevent ANSI escape codes
-    from corrupting terminal scroll buffers on Windows PowerShell 5.1.
-    """
-    stable = nx.Graph()
-    stable.add_nodes_from(sorted(G.nodes(), key=str))
-    edge_rows = sorted(
-        G.edges(data=True),
-        key=lambda row: (
-            str(row[0]),
-            str(row[1]),
-            json.dumps(row[2], sort_keys=True, ensure_ascii=False, default=str),
-        ),
-    )
-    for src, tgt, attrs in edge_rows:
-        stable.add_edge(src, tgt, **attrs)
-
-    try:
-        from graspologic.partition import leiden
-        lsig = inspect.signature(leiden).parameters
-        kwargs: dict = {}
-        if "random_seed" in lsig:
-            kwargs["random_seed"] = 42
-        if "trials" in lsig:
-            kwargs["trials"] = 1
-        if "resolution" in lsig:
-            kwargs["resolution"] = resolution
-        # Suppress graspologic output to prevent ANSI escape codes from
-        # corrupting PowerShell 5.1 scroll buffer (issue #19)
-        old_stderr = sys.stderr
-        try:
-            sys.stderr = io.StringIO()
-            with _suppress_output():
-                result = leiden(stable, **kwargs)
-        finally:
-            sys.stderr = old_stderr
-        return result
-    except ImportError:
-        pass
-
-    # Fallback: networkx louvain (available since networkx 2.7).
-    # Inspect kwargs to stay compatible across NetworkX versions — max_level
-    # was added in a later release and prevents hangs on large sparse graphs.
-    kwargs: dict = {"seed": 42, "threshold": 1e-4, "resolution": resolution}
-    if "max_level" in inspect.signature(nx.community.louvain_communities).parameters:
-        kwargs["max_level"] = 10
-    communities = nx.community.louvain_communities(stable, **kwargs)
-    return {node: cid for cid, nodes in enumerate(communities) for node in nodes}
+    return G.louvain_partition(resolution=resolution)
 
 
 _MAX_COMMUNITY_FRACTION = 0.25   # communities larger than 25% of graph get split
 _MIN_SPLIT_SIZE = 10             # only split if community has at least this many nodes
 _COHESION_SPLIT_THRESHOLD = 0.05 # re-split communities with cohesion below this
 _COHESION_SPLIT_MIN_SIZE = 50    # only cohesion-split if community has at least this many nodes
+
+
+def label_communities_by_hub(
+    G: nx.Graph, communities: dict[int, list[str]]
+) -> dict[int, str]:
+    """Deterministic, LLM-free community labels: name each community after its
+    highest-degree member — the structural hub — so a report reads ``auth`` /
+    ``log_action`` instead of ``Community 70``. Degree is measured on the full graph
+    ``G``; ties break by node id for run-to-run stability. A community whose members
+    are all absent from ``G`` falls back to ``Community {cid}``.
+
+    Used as the default (no-backend) labeler; an LLM naming pass, when configured,
+    overrides these with richer names.
+    """
+    labels: dict[int, str] = {}
+    for cid, members in communities.items():
+        present = [n for n in members if n in G]
+        if not present:
+            labels[cid] = f"Community {cid}"
+            continue
+        # highest degree wins; ties broken by node id (ascending) for determinism
+        hub = min(present, key=lambda n: (-G.degree(n), str(n)))
+        name = str(G.nodes[hub].get("label") or hub).strip()
+        if name.endswith("()"):
+            name = name[:-2]
+        labels[cid] = name or f"Community {cid}"
+    return labels
+
+
+def community_member_sigs(communities: dict[int, list[str]]) -> dict[int, str]:
+    """Per-community membership fingerprints: ``{cid: sha256(sorted member ids)}``.
+
+    Persisted next to ``.graphify_labels.json`` so a later ``cluster-only`` can tell
+    which communities actually changed since labeling. A cid whose members no longer
+    hash the same is a different community — reusing its old (LLM) label there is the
+    "stale label after re-scoping" bug this guards against. Deterministic; independent
+    of cid index, node order, and machine.
+    """
+    import hashlib
+
+    sigs: dict[int, str] = {}
+    for cid, members in communities.items():
+        h = hashlib.sha256()
+        for nid in sorted(str(n) for n in members):
+            h.update(nid.encode("utf-8", "replace"))
+            h.update(b"\x00")
+        sigs[cid] = h.hexdigest()[:16]
+    return sigs
 
 
 def cluster(
@@ -111,21 +98,27 @@ def cluster(
     if G.number_of_edges() == 0:
         return {i: [n] for i, n in enumerate(sorted(G.nodes))}
 
+    # Materialize the full degree map in one streamed pass. Per-node G.degree(n)
+    # against the FalkorDB store is a round-trip each, so the comprehensions below
+    # would otherwise issue O(N) queries (twice over); one dict() keeps it to a
+    # single scan, matching the old in-memory nx cost.
+    degmap = dict(G.degree())
+
     # Compute hub exclusion set before removing anything so degree is based on full graph
     hub_nodes: set[str] = set()
     if exclude_hubs_percentile is not None:
-        degrees = sorted(d for _, d in G.degree())
+        degrees = sorted(degmap.values())
         if degrees:
             idx = max(0, int(len(degrees) * exclude_hubs_percentile / 100) - 1)
             threshold = degrees[idx]
-            hub_nodes = {n for n, d in G.degree() if d > threshold}
+            hub_nodes = {n for n, d in degmap.items() if d > threshold}
 
     # Leiden warns and drops isolates - handle them separately
     # Also exclude hub nodes from partitioning so they don't pull unrelated
     # subsystems into the same community
     excluded = hub_nodes
-    isolates = [n for n in G.nodes() if G.degree(n) == 0 and n not in excluded]
-    connected_nodes = [n for n in G.nodes() if G.degree(n) > 0 and n not in excluded]
+    isolates = [n for n, d in degmap.items() if d == 0 and n not in excluded]
+    connected_nodes = [n for n, d in degmap.items() if d > 0 and n not in excluded]
     connected = G.subgraph(connected_nodes)
 
     raw: dict[int, list[str]] = {}

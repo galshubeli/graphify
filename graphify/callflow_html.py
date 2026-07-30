@@ -30,6 +30,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from html import escape
 
+from graphify.paths import GRAPHIFY_OUT, GRAPHIFY_OUT_NAME
+
 
 # ──────────────────────────────────────────────
 # 1. CSS template (fixed, project-agnostic)
@@ -218,33 +220,32 @@ def normalize_edge(raw: dict, index: int) -> dict | None:
 
 
 def _node_link_payload(data: dict) -> tuple[list, list] | None:
-    """Read current graphify graph.json via NetworkX's node-link parser."""
+    """Parse a node-link graph.json dict directly (no NetworkX)."""
     if not isinstance(data.get("nodes"), list):
         return None
-    if not isinstance(data.get("links"), list) and not isinstance(data.get("edges"), list):
-        return None
-
-    try:
-        from networkx.readwrite import json_graph
-
-        try:
-            graph = json_graph.node_link_graph(data, edges="links")
-        except TypeError:
-            graph = json_graph.node_link_graph(data)
-    except Exception:
+    # Accept the raw writer's "edges" key as well as node-link "links"; without
+    # the fallback an edges-keyed payload silently returned None even though the
+    # shape check accepts it (#2212). Parsed inline — no NetworkX loader needed.
+    links = data.get("links")
+    if not isinstance(links, list):
+        links = data.get("edges")
+    if not isinstance(links, list):
         return None
 
     nodes = []
-    for node_id, attrs in graph.nodes(data=True):
-        node = dict(attrs)
-        node["id"] = node_id
-        nodes.append(node)
+    for n in data["nodes"]:
+        if not isinstance(n, dict):
+            continue
+        nodes.append(dict(n))
 
     edges = []
-    for index, (source, target, attrs) in enumerate(graph.edges(data=True), 1):
-        edge = dict(attrs)
-        edge["source"] = edge.get("_src", edge.get("source", source))
-        edge["target"] = edge.get("_tgt", edge.get("target", target))
+    for index, e in enumerate(links, 1):
+        if not isinstance(e, dict):
+            continue
+        edge = dict(e)
+        # Edges are stored in native direction; _src/_tgt fall back to source/target.
+        edge["source"] = edge.get("_src", edge.get("source"))
+        edge["target"] = edge.get("_tgt", edge.get("target"))
         edge.setdefault("id", f"edge_{index}")
         edges.append(edge)
     return nodes, edges
@@ -404,7 +405,7 @@ def infer_project_name(graph_path: str, meta: dict) -> str:
     if meta.get("project_name"):
         return meta["project_name"]
     path = Path(graph_path).resolve()
-    if path.parent.name == "graphify-out" and len(path.parents) > 1:
+    if path.parent.name == GRAPHIFY_OUT_NAME and len(path.parents) > 1:
         return path.parents[1].name
     return path.parent.name or "Project"
 
@@ -419,9 +420,9 @@ def resolve_graphify_paths(args) -> dict:
     elif (base / "graph.json").exists():
         graphify_out = base
     else:
-        graphify_out = base / "graphify-out"
+        graphify_out = base / GRAPHIFY_OUT
 
-    project_root = graphify_out.parent if graphify_out.name == "graphify-out" else base
+    project_root = graphify_out.parent if graphify_out.name == GRAPHIFY_OUT_NAME else base
     graph = Path(args.graph).expanduser() if args.graph else graphify_out / "graph.json"
     report = Path(args.report).expanduser() if args.report else graphify_out / "GRAPH_REPORT.md"
     labels = Path(args.labels).expanduser() if args.labels else graphify_out / ".graphify_labels.json"

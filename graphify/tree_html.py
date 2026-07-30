@@ -125,9 +125,12 @@ def build_tree(
         sym_children: List[Dict[str, Any]] = []
         for n in syms:
             label = n.get("label", n.get("id", "?"))
-            # Skip the redundant file-name node graphify emits.
-            if label == src_path.name and n.get("file_type") == "code":
-                continue
+            # Skip the redundant file-name node graphify emits (bare basename or
+            # the directory-qualified form from the #2032 disambiguation pass).
+            if n.get("file_type") == "code":
+                from graphify.build import _is_file_node_label
+                if _is_file_node_label(label, src_file):
+                    continue
             sym_children.append({
                 "name": label,
                 "total_count": 1,
@@ -549,7 +552,7 @@ def emit_html(
 ) -> str:
     # Escape </script> sequences so embedded JSON cannot break out of the
     # <script> tag, and HTML-escape values that land in <title>/<h1>.
-    data_json = json.dumps(tree, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    data_json = json.dumps(tree, ensure_ascii=True, separators=(",", ":")).replace("</", "<\\/")
     return _HTML_TEMPLATE.format(
         title=_html.escape(title),
         header=_html.escape(header),
