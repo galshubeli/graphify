@@ -2352,6 +2352,12 @@ def dispatch_command(cmd: str) -> None:
                         f"{result['deleted_edges']} edges)"
                     )
                 print(f"Pushed to FalkorDB [{push_graph_name}]: {_summary}")
+                if not push_prune and result.get("target_surplus"):
+                    print(
+                        f"  note: target has {result['target_surplus']} node(s) the "
+                        f"source does not; --prune converges it.",
+                        file=sys.stderr,
+                    )
             else:
                 from graphify.export import to_cypher as _to_cypher
                 _to_cypher(G, str(out_dir / "cypher.txt"))

@@ -430,3 +430,26 @@ def test_delta_refuses_a_manifest_aimed_at_the_wrong_database(db, global_src):
         )
 
     assert _entity_counts(db)[0] == 40  # nothing touched
+
+
+def test_add_only_push_reports_the_drift_it_cannot_fix(db):
+    """#3057's divergence is silent. An add-only push can't converge, but it
+    can say how far the target has drifted (@Azeem1985's review request)."""
+    from graphify.export import push_to_falkordb
+
+    G = _build()
+    push_to_falkordb(G, uri=f"{HOST}:{PORT}", graph_name=GRAPH_NAME)
+    db.select_graph(GRAPH_NAME).query("CREATE (:Entity {id: 'left-behind'})")
+
+    result = push_to_falkordb(G, uri=f"{HOST}:{PORT}", graph_name=GRAPH_NAME)
+
+    assert result["deleted"] == 0          # still add-only
+    assert result["target_surplus"] == 1   # but no longer silent about it
+
+    # A converged target reports no surplus.
+    converged = push_to_falkordb(
+        G, uri=f"{HOST}:{PORT}", graph_name=GRAPH_NAME, prune=True, allow_shrink=True
+    )
+    assert converged["deleted"] == 1
+    after = push_to_falkordb(G, uri=f"{HOST}:{PORT}", graph_name=GRAPH_NAME)
+    assert after["target_surplus"] == 0

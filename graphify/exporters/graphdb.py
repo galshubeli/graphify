@@ -510,12 +510,20 @@ def push_to_falkordb(
         edges_pushed += len(chunk)
 
     deleted = deleted_edges = 0
+    surplus = 0
     if prune:
         deleted, deleted_edges = _converge(run, count, epoch, allow_shrink, shrink_limit)
+    else:
+        # An add-only push cannot converge, and #3057's whole point is that the
+        # divergence is SILENT. Report it: the same "not stamped by this push"
+        # count the prune path would delete tells the caller exactly how far the
+        # target has drifted, so a one-line notice can replace the silence.
+        surplus = count(f"{_STALE_NODES} RETURN count(n)", {"epoch": epoch})
 
     return {
         "nodes": nodes_pushed,
         "edges": edges_pushed,
         "deleted": deleted,
         "deleted_edges": deleted_edges,
+        "target_surplus": surplus,
     }
